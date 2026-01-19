@@ -1,0 +1,6 @@
+.vscode
+.venv
+__pycache__
+dataset_raw
+runs
+.ruff_cache
