@@ -67,22 +67,18 @@ class WorldModel(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.d_model = 256  # Internal thinking size
+        self.d_model = 256
 
-        # 1. Inputs
         self.z_emb = nn.Linear(LATENT_DIM, self.d_model)
         self.a_emb = nn.Linear(ACTION_DIM, self.d_model)
 
-        # 2. Positional Encoding (So it knows time order)
         self.pos_emb = nn.Parameter(torch.zeros(1, SEQ_LEN, self.d_model))
 
-        # 3. The Transformer (GPT-style)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.d_model, nhead=8, batch_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
 
-        # 4. Prediction Head (Predict next z)
         self.predict_head = nn.Linear(self.d_model, LATENT_DIM)
 
     def forward(self, z, action):
