@@ -108,7 +108,7 @@ CITYSCAPES_CLASSES = 19
 
 
 class VQVAE(nn.Module):
-    def __init__(self, num_embeddings=512, embedding_dim=128, num_seg_classes=CITYSCAPES_CLASSES):
+    def __init__(self, num_embeddings=1024, embedding_dim=128, num_seg_classes=CITYSCAPES_CLASSES):
         super().__init__()
 
         self.encoder = nn.Sequential(
@@ -118,21 +118,17 @@ class VQVAE(nn.Module):
             nn.ReLU(),
             nn.Conv2d(64, 128, 4, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(128, 256, 4, stride=2, padding=1),
-            nn.ReLU(),
-            ResBlock(256),
-            ResBlock(256),
-            nn.Conv2d(256, embedding_dim, 1),  # project to codebook dim
+            ResBlock(128),
+            ResBlock(128),
+            nn.Conv2d(128, embedding_dim, 1),  # project to codebook dim
         )
 
         self.quantizer = VectorQuantizer(num_embeddings, embedding_dim)
 
         self.decoder = nn.Sequential(
-            nn.Conv2d(embedding_dim, 256, 1),  # project back up
-            ResBlock(256),
-            ResBlock(256),
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(embedding_dim, 128, 1),  # project back up
+            ResBlock(128),
+            ResBlock(128),
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
             nn.ReLU(),
             nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
@@ -141,12 +137,9 @@ class VQVAE(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Segmentation head: takes z_q (1/16 res) → full-res class logits
+        # Segmentation head: takes z_q (1/8 res) → full-res class logits
         self.seg_head = nn.Sequential(
-            nn.Conv2d(embedding_dim, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(128, 64, 3, padding=1),
+            nn.Conv2d(embedding_dim, 64, 3, padding=1),
             nn.ReLU(),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(64, 32, 3, padding=1),
