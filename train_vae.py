@@ -1,23 +1,25 @@
-from torch.utils.data import Dataset, DataLoader
-from torchvision.utils import save_image
+import os
+import uuid
+from datetime import datetime
 import cv2
 import glob
 import json
-import os
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision.utils import save_image
 from tqdm import tqdm
 from models import VAE
 
 MASK_COORDS_PATH = "mask_coords.json"
 PRIORITY_COORDS_PATH = "priority_coords.json"
 
-DEVICE = "mps"
+DEVICE = "cuda"
 DATA_PATH = "dataset_raw/images/*.jpg"
 EPOCHS = 100
 BATCH_SIZE = 64
-LEARNING_RATE = 3e-3
-PRIORITY_WEIGHT = 5.0  # How much more to weight the priority region
+LEARNING_RATE = 1e-3
+PRIORITY_WEIGHT = 100.0  # How much more to weight the priority region
 
 
 class DriveDataset(Dataset):
@@ -105,6 +107,12 @@ def main():
         height, width, priority_coords, PRIORITY_WEIGHT, DEVICE
     )
 
+    # Create unique run directory
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
+    run_dir = os.path.join("runs", run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Saving outputs to: {run_dir}")
+
     # Train
     for epoch in range(EPOCHS):
         total_loss = 0
@@ -127,17 +135,26 @@ def main():
 
         print(f"Epoch {epoch + 1} Average Loss: {total_loss / len(dataset):.2f}")
 
+        if (epoch + 1) % 10 == 0:
+            checkpoint_path = os.path.join(run_dir, f"vae_epoch_{epoch + 1}.pth")
+            torch.save(model.state_dict(), checkpoint_path)
+            print(f"Checkpoint saved to {checkpoint_path}")
+
         if last_batch is not None:
             with torch.no_grad():
                 sample = last_batch[:8]
                 recon, _, _ = model(sample)
                 comparison = torch.cat([sample, recon], dim=0)
 
-                save_image(comparison, f"vae_epoch_{epoch + 1}.png", nrow=8)
+                save_image(
+                    comparison,
+                    os.path.join(run_dir, f"vae_epoch_{epoch + 1}.png"),
+                    nrow=8,
+                )
 
     # Save Model
-    torch.save(model.state_dict(), "vae.pth")
-    print("Model saved to vae.pth!")
+    torch.save(model.state_dict(), os.path.join(run_dir, "vae.pth"))
+    print(f"Model saved to {os.path.join(run_dir, 'vae.pth')}!")
 
 
 if __name__ == "__main__":

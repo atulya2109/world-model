@@ -5,6 +5,5 @@ dataset_raw
 runs
 .ruff_cache
 dataset.zip
-
 mask_preview.png
 priority_preview.png
