@@ -7,25 +7,18 @@ import json
 import lpips
 import torch
 import torch.nn.functional as F
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
-from transformers import SegformerForSemanticSegmentation
 
 from tqdm import tqdm
 from models import VQVAE
 
 MASK_COORDS_PATH = "mask_coords.json"
 PRIORITY_COORDS_PATH = "priority_coords.json"
-
-# Cityscapes 19-class color palette (RGB)
-CITYSCAPES_COLORS = torch.tensor([
-    [128, 64, 128], [244, 35, 232], [70, 70, 70], [102, 102, 156],
-    [190, 153, 153], [153, 153, 153], [250, 170, 30], [220, 220, 0],
-    [107, 142, 35], [152, 251, 152], [70, 130, 180], [220, 20, 60],
-    [255, 0, 0], [0, 0, 142], [0, 0, 70], [0, 60, 100],
-    [0, 80, 100], [0, 0, 230], [119, 11, 32],
-], dtype=torch.float32) / 255.0  # (19, 3)
+SEG_LABELS_DIR = "dataset_raw/seg_labels"
 
 DEVICE = "cuda"
 DATA_PATH = "dataset_raw/images/*.jpg"
@@ -34,16 +27,11 @@ BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
 PRIORITY_WEIGHT = 100.0  # How much more to weight the priority region
 SEG_LOSS_WEIGHT = 0.5
-LPIPS_LOSS_WEIGHT = 0.1
-SEGFORMER_MODEL = "nvidia/segformer-b0-finetuned-cityscapes-512-1024"
-
-# ImageNet normalization for SegFormer input
-SEG_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-SEG_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+LPIPS_LOSS_WEIGHT = 0.05
 
 
 class DriveDataset(Dataset):
-    def __init__(self, glob_pattern, mask_coords_path=MASK_COORDS_PATH):
+    def __init__(self, glob_pattern, mask_coords_path=MASK_COORDS_PATH, seg_labels_dir=SEG_LABELS_DIR):
         super().__init__()
         self.files = sorted(glob.glob(glob_pattern))
         print(f"Found {len(self.files)} images.")
@@ -56,13 +44,18 @@ class DriveDataset(Dataset):
         else:
             print("No mask_coords.json found - using full images")
 
+        self.seg_labels_dir = seg_labels_dir
+        has_labels = os.path.isdir(seg_labels_dir) and len(os.listdir(seg_labels_dir)) > 0
+        print(f"Pre-computed seg labels: {'enabled' if has_labels else 'NOT FOUND — run precompute_seg.py first'}")
+
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
-        img = cv2.imread(self.files[idx])
+        path = self.files[idx]
+        img = cv2.imread(path)
         if img is None:
-            raise ValueError(f"Failed to load image: {self.files[idx]}")
+            raise ValueError(f"Failed to load image: {path}")
 
         if self.mask_coords is not None:
             x1 = self.mask_coords["x1"]
@@ -75,32 +68,11 @@ class DriveDataset(Dataset):
         img = img / 255.0
         img = torch.FloatTensor(img).permute(2, 0, 1)
 
-        return img
+        stem = os.path.splitext(os.path.basename(path))[0]
+        label_path = os.path.join(self.seg_labels_dir, f"{stem}.pt")
+        seg_label = torch.load(label_path, weights_only=True).long()
 
-
-def colorize_labels(labels):
-    """Convert (B, H, W) int label tensor to (B, 3, H, W) RGB using cityscapes palette."""
-    palette = CITYSCAPES_COLORS.to(labels.device)  # (19, 3)
-    labels_clamped = labels.clamp(0, len(palette) - 1)
-    colored = palette[labels_clamped]  # (B, H, W, 3)
-    return colored.permute(0, 3, 1, 2)  # (B, 3, H, W)
-
-
-def save_seg_maps(segformer, sample, recon, seg_mean, seg_std, path):
-    """Save a side-by-side grid of original and reconstructed segmentation maps."""
-    orig_labels = get_pseudo_labels(segformer, sample, seg_mean, seg_std)
-    recon_labels = get_pseudo_labels(segformer, recon.clamp(0, 1), seg_mean, seg_std)
-    orig_colored = colorize_labels(orig_labels)
-    recon_colored = colorize_labels(recon_labels)
-    comparison = torch.cat([orig_colored, recon_colored], dim=0)
-    save_image(comparison, path, nrow=len(sample))
-
-
-def get_pseudo_labels(segformer, batch, seg_mean, seg_std):
-    normalized = (batch - seg_mean) / seg_std
-    with torch.no_grad():
-        logits = segformer(pixel_values=normalized).logits  # (B, 19, H/4, W/4)
-    return F.interpolate(logits, size=batch.shape[-2:], mode='bilinear', align_corners=False).argmax(dim=1)
+        return img, seg_label
 
 
 def loss_fn(recon_x, x, vq_loss, seg_logits, pseudo_labels, lpips_loss, weight_mask=None):
@@ -138,28 +110,19 @@ def main():
         print("No priority_coords.json found - using uniform loss weighting")
 
     # Load frozen LPIPS perceptual loss (VGG)
-    lpips_fn = lpips.LPIPS(net="vgg").to(DEVICE)
+    lpips_fn = lpips.LPIPS(net="alex").to(DEVICE)
     for p in lpips_fn.parameters():
         p.requires_grad_(False)
-
-    # Load frozen SegFormer for pseudo-label generation
-    print(f"Loading SegFormer ({SEGFORMER_MODEL})...")
-    segformer = SegformerForSemanticSegmentation.from_pretrained(SEGFORMER_MODEL)
-    segformer = segformer.to(DEVICE)  # type: ignore[arg-type]
-    segformer.eval()
-    for p in segformer.parameters():
-        p.requires_grad_(False)
-    seg_mean = SEG_MEAN.to(DEVICE)
-    seg_std = SEG_STD.to(DEVICE)
 
     # Setup
     dataset = DriveDataset(DATA_PATH)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
     model = VQVAE().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scaler = GradScaler(device=DEVICE)
 
     # Create priority mask (assumes all images are same size)
-    sample_img = dataset[0]
+    sample_img, _ = dataset[0]
     _, height, width = sample_img.shape
     weight_mask = create_priority_mask(
         height, width, priority_coords, PRIORITY_WEIGHT, DEVICE
@@ -189,18 +152,20 @@ def main():
         last_batch = None
         loop = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{EPOCHS}")
 
-        for batch in loop:
+        for batch, pseudo_labels in loop:
             batch = batch.to(DEVICE)
+            pseudo_labels = pseudo_labels.to(DEVICE)
             optimizer.zero_grad()
 
-            pseudo_labels = get_pseudo_labels(segformer, batch, seg_mean, seg_std)
-            recon, vq_loss, indices, seg_logits = model(batch)
-            # LPIPS expects images in [-1, 1]
-            lpips_loss = lpips_fn(recon * 2 - 1, batch * 2 - 1).mean()
-            loss, recon_loss, seg_loss = loss_fn(recon, batch, vq_loss, seg_logits, pseudo_labels, lpips_loss, weight_mask)
+            with autocast(device_type=DEVICE):
+                recon, vq_loss, indices, seg_logits = model(batch)
+                # LPIPS expects images in [-1, 1]
+                lpips_loss = lpips_fn(recon * 2 - 1, batch * 2 - 1).mean()
+                loss, recon_loss, seg_loss = loss_fn(recon, batch, vq_loss, seg_logits, pseudo_labels, lpips_loss, weight_mask)
 
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             total_recon_loss += recon_loss.item()
@@ -234,24 +199,15 @@ def main():
             torch.save(model.state_dict(), checkpoint_path)
             print(f"Checkpoint saved to {checkpoint_path}")
 
-            if last_batch is not None:
-                with torch.no_grad():
-                    sample = last_batch[:8]
-                    recon, _, _, _ = model(sample)
-                    comparison = torch.cat([sample, recon], dim=0)
-
-                    save_image(
-                        comparison,
-                        os.path.join(samples_dir, f"epoch_{epoch + 1}.png"),
-                        nrow=8,
-                    )
-
-                    if (epoch + 1) % 20 == 0:
-                        save_seg_maps(
-                            segformer, sample, recon, seg_mean, seg_std,
-                            os.path.join(samples_dir, f"seg_epoch_{epoch + 1}.png"),
-                        )
-                        print(f"Segmentation maps saved for epoch {epoch + 1}")
+            with torch.no_grad(), autocast(device_type=DEVICE):
+                sample = last_batch[:8]  # type: ignore[index]
+                recon, _, _, _ = model(sample)
+                comparison = torch.cat([sample.float(), recon.float()], dim=0)
+                save_image(
+                    comparison,
+                    os.path.join(samples_dir, f"epoch_{epoch + 1}.png"),
+                    nrow=8,
+                )
 
     # Save final model
     final_path = os.path.join(checkpoints_dir, "final.pth")
