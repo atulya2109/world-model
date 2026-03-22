@@ -1,10 +1,10 @@
+import argparse
 import os
 import uuid
 from datetime import datetime
 import cv2
 import glob
 import json
-import lpips
 import torch
 import torch.nn.functional as F
 from torch.amp.autocast_mode import autocast
@@ -14,20 +14,38 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import save_image
 
 from tqdm import tqdm
-from models import VQVAE
+from models.vae import VQVAE
 
 MASK_COORDS_PATH = "mask_coords.json"
-PRIORITY_COORDS_PATH = "priority_coords.json"
 SEG_LABELS_DIR = "dataset_raw/seg_labels"
 
 DEVICE = "cuda"
 DATA_PATH = "dataset_raw/images/*.jpg"
 EPOCHS = 100
-BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
-PRIORITY_WEIGHT = 100.0  # How much more to weight the priority region
+BATCH_SIZE = 32
+LEARNING_RATE = 5e-4
 SEG_LOSS_WEIGHT = 0.5
-LPIPS_LOSS_WEIGHT = 0.05
+CLASS_VAR_PENALTY = [
+    0.0,  # 0  road          — critical, use as many codes as needed
+    0.05, # 1  sidewalk
+    0.2,  # 2  building
+    0.3,  # 3  wall
+    0.3,  # 4  fence
+    0.1,  # 5  pole
+    0.0,  # 6  traffic light — critical
+    0.0,  # 7  traffic sign  — critical
+    0.5,  # 8  vegetation    — unimportant
+    0.3,  # 9  terrain
+    0.5,  # 10 sky           — unimportant
+    0.0,  # 11 person        — critical
+    0.0,  # 12 rider         — critical
+    0.0,  # 13 car           — critical
+    0.0,  # 14 truck         — critical
+    0.0,  # 15 bus           — critical
+    0.1,  # 16 train
+    0.0,  # 17 motorcycle    — critical
+    0.0,  # 18 bicycle       — critical
+]
 
 
 class DriveDataset(Dataset):
@@ -75,58 +93,32 @@ class DriveDataset(Dataset):
         return img, seg_label
 
 
-def loss_fn(recon_x, x, vq_loss, seg_logits, pseudo_labels, lpips_loss, weight_mask=None):
-    if weight_mask is not None:
-        mse_per_pixel = (recon_x - x) ** 2
-        recon_loss = (mse_per_pixel * weight_mask).mean()
-    else:
-        recon_loss = F.mse_loss(recon_x, x, reduction="mean")
+def loss_fn(recon_x, x, vq_loss, seg_logits, pseudo_labels):
+    recon_loss = F.mse_loss(recon_x, x, reduction="mean")
 
     seg_loss = F.cross_entropy(seg_logits, pseudo_labels)
-    total_loss = recon_loss + vq_loss * x.size(0) + SEG_LOSS_WEIGHT * seg_loss + LPIPS_LOSS_WEIGHT * lpips_loss
+    total_loss = recon_loss + vq_loss * x.size(0) + SEG_LOSS_WEIGHT * seg_loss
     return total_loss, recon_loss, seg_loss
 
 
-def create_priority_mask(height, width, priority_coords, priority_weight, device):
-    """Create a weight mask with higher values in the priority region."""
-    mask = torch.ones(1, 1, height, width, device=device)
-    if priority_coords is not None:
-        x1, y1 = priority_coords["x1"], priority_coords["y1"]
-        x2, y2 = priority_coords["x2"], priority_coords["y2"]
-        mask[:, :, y1:y2, x1:x2] = priority_weight
-    return mask
-
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to a VQVAE checkpoint to resume from")
+    parser.add_argument("--start_epoch", type=int, default=0, help="Epoch to resume from (for logging continuity)")
+    args = parser.parse_args()
+
     print(f"Training on {DEVICE}...")
-
-    # Load priority coords if available
-    priority_coords = None
-    if os.path.exists(PRIORITY_COORDS_PATH):
-        with open(PRIORITY_COORDS_PATH, "r") as f:
-            priority_coords = json.load(f)
-        print(f"Priority region enabled: {priority_coords} (weight={PRIORITY_WEIGHT})")
-    else:
-        print("No priority_coords.json found - using uniform loss weighting")
-
-    # Load frozen LPIPS perceptual loss (VGG)
-    lpips_fn = lpips.LPIPS(net="alex").to(DEVICE)
-    for p in lpips_fn.parameters():
-        p.requires_grad_(False)
 
     # Setup
     dataset = DriveDataset(DATA_PATH)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
     model = VQVAE().to(DEVICE)
+    if args.checkpoint:
+        model.load_state_dict(torch.load(args.checkpoint, map_location=DEVICE, weights_only=True))
+        print(f"Resumed from checkpoint: {args.checkpoint}")
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scaler = GradScaler(device=DEVICE)
-
-    # Create priority mask (assumes all images are same size)
-    sample_img, _ = dataset[0]
-    _, height, width = sample_img.shape
-    weight_mask = create_priority_mask(
-        height, width, priority_coords, PRIORITY_WEIGHT, DEVICE
-    )
 
     # Create unique run directory
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
@@ -140,17 +132,19 @@ def main():
 
     writer = SummaryWriter(log_dir=tb_dir)
     codebook_size = model.quantizer.codebook.num_embeddings
+    var_penalty_tensor = torch.tensor(CLASS_VAR_PENALTY, device=DEVICE)
 
     # Train
-    for epoch in range(EPOCHS):
+    for epoch in range(args.start_epoch, args.start_epoch + EPOCHS):
         total_loss = 0
         total_recon_loss = 0
         total_vq_loss = 0
         total_seg_loss = 0
-        total_lpips_loss = 0
+        total_var_loss = 0
         total_unique = 0
+        total_perplexity = 0
         last_batch = None
-        loop = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{EPOCHS}")
+        loop = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{args.start_epoch + EPOCHS}")
 
         for batch, pseudo_labels in loop:
             batch = batch.to(DEVICE)
@@ -158,10 +152,23 @@ def main():
             optimizer.zero_grad()
 
             with autocast(device_type=DEVICE):
-                recon, vq_loss, indices, seg_logits = model(batch)
-                # LPIPS expects images in [-1, 1]
-                lpips_loss = lpips_fn(recon * 2 - 1, batch * 2 - 1).mean()
-                loss, recon_loss, seg_loss = loss_fn(recon, batch, vq_loss, seg_logits, pseudo_labels, lpips_loss, weight_mask)
+                recon, vq_loss, indices, seg_logits, z_e = model(batch)
+                loss, recon_loss, seg_loss = loss_fn(recon, batch, vq_loss, seg_logits, pseudo_labels)
+
+                batch_var_loss = torch.zeros(1, device=DEVICE)
+                labels_latent = F.interpolate(
+                    pseudo_labels.float().unsqueeze(1), size=z_e.shape[-2:], mode='nearest'
+                ).squeeze(1).long()  # (B, H, W)
+                z_e_hwd = z_e.permute(0, 2, 3, 1)  # (B, H, W, D)
+                for cls_idx in labels_latent.unique():
+                    penalty = var_penalty_tensor[cls_idx]
+                    if penalty == 0.0:
+                        continue
+                    cls_latents = z_e_hwd[labels_latent == cls_idx]  # (N_cls, D)
+                    if cls_latents.size(0) < 2:
+                        continue
+                    batch_var_loss = batch_var_loss + penalty * cls_latents.var(dim=0).mean()
+                loss = loss + batch_var_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -171,8 +178,13 @@ def main():
             total_recon_loss += recon_loss.item()
             total_vq_loss += vq_loss.item()
             total_seg_loss += seg_loss.item()
-            total_lpips_loss += lpips_loss.item()
-            total_unique += indices.unique().numel()
+            total_var_loss += batch_var_loss.item()
+            idx_cpu = indices.view(-1).cpu()
+            total_unique += idx_cpu.unique().numel()
+            counts = torch.bincount(idx_cpu, minlength=codebook_size).float()
+            probs = counts / counts.sum()
+            perplexity = torch.exp(-torch.sum(probs * torch.log(probs + 1e-10)))
+            total_perplexity += perplexity.item()
             last_batch = batch
             loop.set_postfix(loss=loss.item() / len(batch))
 
@@ -181,27 +193,35 @@ def main():
         avg_recon = total_recon_loss / n_batches
         avg_vq = total_vq_loss / n_batches
         avg_seg = total_seg_loss / n_batches
-        avg_lpips = total_lpips_loss / n_batches
+        avg_var = total_var_loss / n_batches
         avg_unique = total_unique / n_batches
+        avg_perplexity = total_perplexity / n_batches
 
         writer.add_scalar("loss/total", avg_loss, epoch)
         writer.add_scalar("loss/recon", avg_recon, epoch)
         writer.add_scalar("loss/vq", avg_vq, epoch)
         writer.add_scalar("loss/seg", avg_seg, epoch)
-        writer.add_scalar("loss/lpips", avg_lpips, epoch)
+        writer.add_scalar("loss/var", avg_var, epoch)
         writer.add_scalar("codebook/unique_usage", avg_unique, epoch)
         writer.add_scalar("codebook/usage_pct", avg_unique / codebook_size * 100, epoch)
+        writer.add_scalar("codebook/perplexity", avg_perplexity, epoch)
+        writer.add_scalar("codebook/perplexity_pct", avg_perplexity / codebook_size * 100, epoch)
 
-        print(f"Epoch {epoch + 1} Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | VQ: {avg_vq:.4f} | Seg: {avg_seg:.4f} | LPIPS: {avg_lpips:.4f} | Codebook: {avg_unique:.0f}/{codebook_size}")
+        mem_alloc = torch.cuda.memory_allocated() / 1024**2
+        mem_reserved = torch.cuda.memory_reserved() / 1024**2
+        writer.add_scalar("cuda/allocated_mb", mem_alloc, epoch)
+        writer.add_scalar("cuda/reserved_mb", mem_reserved, epoch)
 
-        if (epoch + 1) % 10 == 0:
+        print(f"Epoch {epoch + 1} Loss: {avg_loss:.4f} | Recon: {avg_recon:.4f} | VQ: {avg_vq:.4f} | Seg: {avg_seg:.4f} | Var: {avg_var:.4f} | Codebook: {avg_unique:.0f}/{codebook_size} | Perplexity: {avg_perplexity:.1f}/{codebook_size} | CUDA: {mem_alloc:.0f}/{mem_reserved:.0f} MB (alloc/reserved)")
+
+        if (epoch + 1) % 10 == 0 or epoch == args.start_epoch + EPOCHS - 1:
             checkpoint_path = os.path.join(checkpoints_dir, f"epoch_{epoch + 1}.pth")
             torch.save(model.state_dict(), checkpoint_path)
             print(f"Checkpoint saved to {checkpoint_path}")
 
             with torch.no_grad(), autocast(device_type=DEVICE):
                 sample = last_batch[:8]  # type: ignore[index]
-                recon, _, _, _ = model(sample)
+                recon, _, _, _, _ = model(sample)
                 comparison = torch.cat([sample.float(), recon.float()], dim=0)
                 save_image(
                     comparison,
