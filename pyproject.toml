@@ -24,4 +24,5 @@ dependencies = [
     "setuptools>=82.0.1",
     "tensorboard>=2.20.0",
     "lpips>=0.1.4",
+    "pandas>=3.0.1",
 ]
